@@ -1,0 +1,41 @@
+# Datasets and large assets
+datasets/
+*.pth
+*.pt
+STTran/data/glove*.pt
+STTran/dataloader/object_bbox_and_relationship_filtersmall.pkl
+STTran/fasterRCNN/models/*.pth
+
+# Build artifacts
+__pycache__/
+*.pyc
+*.pyo
+**/lib/build/
+**/*.egg-info/
+*.so
+*.egg-info/
+.eggs/
+
+# Outputs and logs
+outputs/
+logs/
+*.out
+*.log
+
+# IDE and misc
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Python
+*.egg
+.Python
+venv/
+.venv/
+env/
+
+# Static ffmpeg binary (downloaded, not source)
+tools/ffmpeg-7.0.2-amd64-static/
+tools/*.tar.xz

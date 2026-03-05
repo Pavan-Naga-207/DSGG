@@ -1,0 +1,36 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+from torch import nn
+from torchvision.ops import roi_align as tv_roi_align
+
+
+def roi_align(input, roi, output_size, spatial_scale, sampling_ratio):
+    # Keep aligned=False for compatibility with legacy operator behavior.
+    return tv_roi_align(
+        input,
+        roi,
+        output_size=output_size,
+        spatial_scale=spatial_scale,
+        sampling_ratio=sampling_ratio,
+        aligned=False,
+    )
+
+
+class ROIAlign(nn.Module):
+    def __init__(self, output_size, spatial_scale, sampling_ratio):
+        super(ROIAlign, self).__init__()
+        self.output_size = output_size
+        self.spatial_scale = spatial_scale
+        self.sampling_ratio = sampling_ratio
+
+    def forward(self, input, rois):
+        return roi_align(
+            input, rois, self.output_size, self.spatial_scale, self.sampling_ratio
+        )
+
+    def __repr__(self):
+        tmpstr = self.__class__.__name__ + "("
+        tmpstr += "output_size=" + str(self.output_size)
+        tmpstr += ", spatial_scale=" + str(self.spatial_scale)
+        tmpstr += ", sampling_ratio=" + str(self.sampling_ratio)
+        tmpstr += ")"
+        return tmpstr
