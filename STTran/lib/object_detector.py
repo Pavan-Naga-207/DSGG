@@ -5,24 +5,51 @@ import numpy as np
 import copy
 import cv2
 import os
+import sys
 
 from lib.funcs import assign_relations
 from lib.draw_rectangles.draw_rectangles import draw_union_boxes
 from fasterRCNN.lib.model.faster_rcnn.resnet import resnet
 from fasterRCNN.lib.model.rpn.bbox_transform import bbox_transform_inv, clip_boxes
 from fasterRCNN.lib.model.roi_layers import nms
+try:
+    from phase2_vitdet.adapter import ViTDetBackbone
+except ImportError:
+    _special_topics_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    if _special_topics_root not in sys.path:
+        sys.path.insert(0, _special_topics_root)
+    from phase2_vitdet.adapter import ViTDetBackbone
 
 class detector(nn.Module):
 
     '''first part: object detection (image/video)'''
 
-    def __init__(self, train, object_classes, use_SUPPLY, mode='predcls'):
+    def __init__(
+        self,
+        train,
+        object_classes,
+        use_SUPPLY,
+        mode='predcls',
+        backbone='resnet101',
+        det_threshold=0.1,
+    ):
         super(detector, self).__init__()
 
         self.is_train = train
         self.use_SUPPLY = use_SUPPLY
         self.object_classes = object_classes
         self.mode = mode
+        self.backbone_name = backbone.lower()
+        if det_threshold is None:
+            det_threshold = float(os.environ.get('DET_THRESHOLD', '0.1'))
+        self.det_threshold = float(det_threshold)
+        if self.det_threshold < 0.0:
+            raise ValueError('det_threshold must be non-negative, got {}'.format(self.det_threshold))
+        self.max_train_rois = int(os.environ.get('VITDET_MAX_TRAIN_ROIS', '256'))
+        self.max_eval_rois = int(os.environ.get('VITDET_MAX_EVAL_ROIS', '1000'))
+        self.detector_chunk = max(1, int(os.environ.get('VITDET_DET_CHUNK', '10')))
+        if self.backbone_name not in ('resnet101', 'vitdet'):
+            raise ValueError('Unsupported backbone: {}. Expected resnet101 or vitdet'.format(backbone))
 
         self.fasterRCNN = resnet(classes=self.object_classes, num_layers=101, pretrained=False, class_agnostic=False)
         self.fasterRCNN.create_architecture()
@@ -32,6 +59,16 @@ class detector(nn.Module):
         self.ROI_Align = copy.deepcopy(self.fasterRCNN.RCNN_roi_align)
         self.RCNN_Head = copy.deepcopy(self.fasterRCNN._head_to_tail)
 
+        self.vitdet = None
+        if self.backbone_name == 'vitdet':
+            # Use 1/16 stride map with 1024 channels to match RPN expectations.
+            self.vitdet = ViTDetBackbone(
+                model_name=os.environ.get('VITDET_MODEL', 'vit_base_patch16_224'),
+                out_channels=int(os.environ.get('VITDET_OUT_CHANNELS', '256')),
+                align_channels=int(os.environ.get('VITDET_ALIGN_CHANNELS', '1024')),
+                freeze_backbone=os.environ.get('VITDET_FREEZE', '1') == '1',
+            )
+
     def forward(self, im_data, im_info, gt_boxes, num_boxes, gt_annotation, im_all):
         device = im_data.device
 
@@ -40,19 +77,20 @@ class detector(nn.Module):
             counter_image = 0
 
             # create saved-bbox, labels, scores, features
-            FINAL_BBOXES = torch.empty(0, device=device)
+            FINAL_BBOXES = torch.empty((0, 5), device=device)
             FINAL_LABELS = torch.empty(0, dtype=torch.int64, device=device)
             FINAL_SCORES = torch.empty(0, device=device)
-            FINAL_FEATURES = torch.empty(0, device=device)
-            FINAL_BASE_FEATURES = torch.empty(0, device=device)
+            feat_dim = self.fasterRCNN.RCNN_cls_score.in_features
+            FINAL_FEATURES = torch.empty((0, feat_dim), device=device)
+            FINAL_BASE_FEATURES = None
 
             while counter < im_data.shape[0]:
-                #compute 10 images in batch and  collect all frames data in the video
-                if counter + 10 < im_data.shape[0]:
-                    inputs_data = im_data[counter:counter + 10]
-                    inputs_info = im_info[counter:counter + 10]
-                    inputs_gtboxes = gt_boxes[counter:counter + 10]
-                    inputs_numboxes = num_boxes[counter:counter + 10]
+                # compute a small frame chunk and collect all frames in the video.
+                if counter + self.detector_chunk < im_data.shape[0]:
+                    inputs_data = im_data[counter:counter + self.detector_chunk]
+                    inputs_info = im_info[counter:counter + self.detector_chunk]
+                    inputs_gtboxes = gt_boxes[counter:counter + self.detector_chunk]
+                    inputs_numboxes = num_boxes[counter:counter + self.detector_chunk]
 
                 else:
                     inputs_data = im_data[counter:]
@@ -60,8 +98,45 @@ class detector(nn.Module):
                     inputs_gtboxes = gt_boxes[counter:]
                     inputs_numboxes = num_boxes[counter:]
 
-                rois, cls_prob, bbox_pred, base_feat, roi_features = self.fasterRCNN(inputs_data, inputs_info,
-                                                                                     inputs_gtboxes, inputs_numboxes)
+                if self.backbone_name == 'vitdet':
+                    feat_dict = self.vitdet(inputs_data)
+                    base_feat = feat_dict['base']
+                    rois, rpn_loss_cls, rpn_loss_bbox = self.fasterRCNN.RCNN_rpn(
+                        base_feat, inputs_info, inputs_gtboxes, inputs_numboxes
+                    )
+                    max_rois = self.max_train_rois if self.is_train else self.max_eval_rois
+                    if max_rois > 0 and rois.shape[1] > max_rois:
+                        rois = rois[:, :max_rois, :]
+                    # Break potential shared storage from RPN internals before RoIAlign
+                    # so autograd-saved proposal tensors are not modified in-place later.
+                    rois = rois.clone()
+                    use_proposal_target = self.training and torch.sum(inputs_numboxes).item() > 0
+                    if use_proposal_target:
+                        roi_data = self.fasterRCNN.RCNN_proposal_target(rois, inputs_gtboxes, inputs_numboxes)
+                        rois, rois_label, rois_target, rois_inside_ws, rois_outside_ws = roi_data
+                        rois_label = rois_label.view(-1).long()
+                        rois_target = rois_target.view(-1, rois_target.size(2))
+                        rois_inside_ws = rois_inside_ws.view(-1, rois_inside_ws.size(2))
+                        rois_outside_ws = rois_outside_ws.view(-1, rois_outside_ws.size(2))
+                    else:
+                        rois_label = None
+                        rois_target = None
+                        rois_inside_ws = None
+                        rois_outside_ws = None
+                        rpn_loss_cls = 0
+                        rpn_loss_bbox = 0
+
+                    pooled_feat = self.fasterRCNN.RCNN_roi_align(base_feat, rois.reshape(-1, 5).clone())
+                    pooled_feat = self.fasterRCNN._head_to_tail(pooled_feat)
+                    cls_score = self.fasterRCNN.RCNN_cls_score(pooled_feat)
+                    cls_prob = torch.softmax(cls_score, 1)
+                    bbox_pred = self.fasterRCNN.RCNN_bbox_pred(pooled_feat)
+                    cls_prob = cls_prob.view(inputs_data.size(0), rois.size(1), -1)
+                    bbox_pred = bbox_pred.view(inputs_data.size(0), rois.size(1), -1)
+                    roi_features = pooled_feat.view(inputs_data.size(0), rois.size(1), -1)
+                else:
+                    rois, cls_prob, bbox_pred, base_feat, roi_features = self.fasterRCNN(inputs_data, inputs_info,
+                                                                                         inputs_gtboxes, inputs_numboxes)
 
                 SCORES = cls_prob.data
                 boxes = rois.data[:, :, 1:5]
@@ -84,7 +159,7 @@ class detector(nn.Module):
 
                     for j in range(1, len(self.object_classes)):
                         # NMS according to obj categories
-                        inds = torch.nonzero(scores[:, j] > 0.1).view(-1) #0.05 is score threshold
+                        inds = torch.nonzero(scores[:, j] > self.det_threshold).view(-1)
                         # if there is det
                         if inds.numel() > 0:
                             cls_scores = scores[:, j][inds]
@@ -113,12 +188,17 @@ class detector(nn.Module):
                             FINAL_LABELS = torch.cat((FINAL_LABELS, final_labels), 0)
                             FINAL_SCORES = torch.cat((FINAL_SCORES, final_score), 0)
                             FINAL_FEATURES = torch.cat((FINAL_FEATURES, final_features), 0)
-                    FINAL_BASE_FEATURES = torch.cat((FINAL_BASE_FEATURES, base_feat[i].unsqueeze(0)), 0)
+                    if FINAL_BASE_FEATURES is None:
+                        FINAL_BASE_FEATURES = base_feat[i].unsqueeze(0)
+                    else:
+                        FINAL_BASE_FEATURES = torch.cat((FINAL_BASE_FEATURES, base_feat[i].unsqueeze(0)), 0)
 
                     counter_image += 1
 
-                counter += 10
+                counter += self.detector_chunk
             FINAL_BBOXES = torch.clamp(FINAL_BBOXES, 0)
+            if FINAL_BASE_FEATURES is None:
+                FINAL_BASE_FEATURES = torch.empty((0,), device=device)
             prediction = {'FINAL_BBOXES': FINAL_BBOXES, 'FINAL_LABELS': FINAL_LABELS, 'FINAL_SCORES': FINAL_SCORES,
                           'FINAL_FEATURES': FINAL_FEATURES, 'FINAL_BASE_FEATURES': FINAL_BASE_FEATURES}
 
@@ -128,10 +208,10 @@ class detector(nn.Module):
 
                 if self.use_SUPPLY:
                     # supply the unfounded gt boxes by detector into the scene graph generation training
-                    FINAL_BBOXES_X = torch.empty(0, device=device)
+                    FINAL_BBOXES_X = torch.empty((0, 5), device=device)
                     FINAL_LABELS_X = torch.empty(0, dtype=torch.int64, device=device)
                     FINAL_SCORES_X = torch.empty(0, device=device)
-                    FINAL_FEATURES_X = torch.empty(0, device=device)
+                    FINAL_FEATURES_X = torch.empty((0, feat_dim), device=device)
                     assigned_labels = torch.tensor(assigned_labels, dtype=torch.long).to(FINAL_BBOXES_X.device)
 
                     for i, j in enumerate(SUPPLY_RELATIONS):
@@ -170,15 +250,19 @@ class detector(nn.Module):
                             GT_RELATIONS[i].extend(SUPPLY_RELATIONS[i])
 
                             # compute the features of unfound gt_boxes
-                            pooled_feat = self.fasterRCNN.RCNN_roi_align(FINAL_BASE_FEATURES[i].unsqueeze(0),
-                                                                         unfound_gt_bboxes)
+                            roi_boxes = unfound_gt_bboxes.clone()
+                            pooled_feat = self.fasterRCNN.RCNN_roi_align(
+                                FINAL_BASE_FEATURES[i].unsqueeze(0),
+                                roi_boxes,
+                            )
                             pooled_feat = self.fasterRCNN._head_to_tail(pooled_feat)
                             cls_prob = F.softmax(self.fasterRCNN.RCNN_cls_score(pooled_feat), 1)
 
-                            unfound_gt_bboxes[:, 0] = i
-                            unfound_gt_bboxes[:, 1:] = unfound_gt_bboxes[:, 1:] / im_info[i, 2]
+                            unfound_gt_bboxes_norm = unfound_gt_bboxes.clone()
+                            unfound_gt_bboxes_norm[:, 0] = i
+                            unfound_gt_bboxes_norm[:, 1:] = unfound_gt_bboxes_norm[:, 1:] / im_info[i, 2]
                             FINAL_BBOXES_X = torch.cat(
-                                (FINAL_BBOXES_X, FINAL_BBOXES[FINAL_BBOXES[:, 0] == i], unfound_gt_bboxes))
+                                (FINAL_BBOXES_X, FINAL_BBOXES[FINAL_BBOXES[:, 0] == i], unfound_gt_bboxes_norm))
                             FINAL_LABELS_X = torch.cat((FINAL_LABELS_X, assigned_labels[FINAL_BBOXES[:, 0] == i],
                                                         unfound_gt_classes))  # final label is not gt!
                             FINAL_SCORES_X = torch.cat(
@@ -308,13 +392,13 @@ class detector(nn.Module):
 
             while counter < im_data.shape[0]:
                 #compute 10 images in batch and  collect all frames data in the video
-                if counter + 10 < im_data.shape[0]:
-                    inputs_data = im_data[counter:counter + 10]
+                if counter + self.detector_chunk < im_data.shape[0]:
+                    inputs_data = im_data[counter:counter + self.detector_chunk]
                 else:
                     inputs_data = im_data[counter:]
                 base_feat = self.fasterRCNN.RCNN_base(inputs_data)
                 FINAL_BASE_FEATURES = torch.cat((FINAL_BASE_FEATURES, base_feat), 0)
-                counter += 10
+                counter += self.detector_chunk
 
             FINAL_BBOXES[:, 1:] = FINAL_BBOXES[:, 1:] * im_info[0, 2]
             FINAL_FEATURES = self.fasterRCNN.RCNN_roi_align(FINAL_BASE_FEATURES, FINAL_BBOXES)

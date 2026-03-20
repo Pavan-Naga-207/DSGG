@@ -22,6 +22,10 @@ logs/
 *.out
 *.log
 
+# Credential helper (local only, do not commit)
+.git-credential-helper
+commit_msg.txt
+
 # IDE and misc
 .idea/
 .vscode/

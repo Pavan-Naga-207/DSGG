@@ -20,7 +20,8 @@ else
   PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 fi
 
-PYTHON_MODULE="${PYTHON_MODULE:-python3/3.11.7}"
+PYTHON_MODULE="${PYTHON_MODULE:-python3/3.11.5}"
+PYTHON_MODULE_FALLBACK="${PYTHON_MODULE_FALLBACK:-python3/3.11.7}"
 VENV_PATH="${VENV_PATH:-$HOME/venvs/sttran311}"
 
 DATA_PATH="${DATA_PATH:-$HOME/special_topics/datasets/action_genome}"
@@ -33,9 +34,17 @@ ENC_LAYER="${ENC_LAYER:-1}"
 DEC_LAYER="${DEC_LAYER:-3}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
 BCE_LOSS="${BCE_LOSS:-0}"
+BACKBONE="${BACKBONE:-resnet101}"
+DET_THRESHOLD="${DET_THRESHOLD:-0.1}"
+CKPT="${CKPT:-}"
 
 module purge
-module load "${PYTHON_MODULE}"
+if ! module load "${PYTHON_MODULE}"; then
+  echo "Requested module unavailable: ${PYTHON_MODULE}"
+  echo "Trying fallback module: ${PYTHON_MODULE_FALLBACK}"
+  module load "${PYTHON_MODULE_FALLBACK}"
+  PYTHON_MODULE="${PYTHON_MODULE_FALLBACK}"
+fi
 
 # Follow CoE HPC activation guidance.
 MODULE_BIN_DIR="$(dirname "$(command -v python3)")"
@@ -87,12 +96,37 @@ export FUSED_ADAMW="${FUSED_ADAMW:-1}"
 export RUN_EVAL="${RUN_EVAL:-0}"
 export CKPT_EVERY="${CKPT_EVERY:-2}"
 export EVAL_EVERY="${EVAL_EVERY:-1}"
+if [[ -z "${TRAIN_DETECTOR:-}" ]]; then
+  if [[ "${BACKBONE}" == "vitdet" ]]; then
+    TRAIN_DETECTOR=1
+  else
+    TRAIN_DETECTOR=0
+  fi
+fi
+export TRAIN_DETECTOR
+export VIT_LR="${VIT_LR:-${LR}}"
+export TASK_LR="${TASK_LR:-1e-4}"
+export WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+export VITDET_MAX_TRAIN_ROIS="${VITDET_MAX_TRAIN_ROIS:-256}"
+export VITDET_MAX_EVAL_ROIS="${VITDET_MAX_EVAL_ROIS:-1000}"
+if [[ -z "${MAX_VIDEO_FRAMES:-}" ]]; then
+  if [[ "${TRAIN_DETECTOR}" == "1" ]]; then
+    MAX_VIDEO_FRAMES=24
+  else
+    MAX_VIDEO_FRAMES=-1
+  fi
+fi
+export MAX_VIDEO_FRAMES
+export VITDET_DET_CHUNK="${VITDET_DET_CHUNK:-4}"
 
 WORLD_SIZE="${WORLD_SIZE:-${SLURM_NTASKS:-1}}"
 CPUS_PER_RANK="${SLURM_CPUS_PER_TASK:-1}"
 export OMP_NUM_THREADS="${CPUS_PER_RANK}"
 if [[ -z "${NUM_WORKERS:-}" ]]; then
-  if [[ "${CPUS_PER_RANK}" -gt 2 ]]; then
+  if [[ "${TRAIN_DETECTOR}" == "1" ]]; then
+    # Avoid forked worker CUDA context duplication when detector is trainable.
+    NUM_WORKERS=0
+  elif [[ "${CPUS_PER_RANK}" -gt 2 ]]; then
     NUM_WORKERS=$((CPUS_PER_RANK - 2))
   else
     NUM_WORKERS=1
@@ -108,7 +142,15 @@ echo "NUM_WORKERS: ${NUM_WORKERS}"
 echo "AMP: ${AMP} (${AMP_DTYPE})"
 echo "RUN_EVAL: ${RUN_EVAL}"
 echo "CKPT_EVERY: ${CKPT_EVERY}"
+echo "Backbone: ${BACKBONE}"
+echo "Det threshold: ${DET_THRESHOLD}"
+echo "TRAIN_DETECTOR: ${TRAIN_DETECTOR}"
+echo "VIT_LR: ${VIT_LR}  TASK_LR: ${TASK_LR}  WEIGHT_DECAY: ${WEIGHT_DECAY}"
+echo "VITDET_MAX_TRAIN_ROIS: ${VITDET_MAX_TRAIN_ROIS}  VITDET_MAX_EVAL_ROIS: ${VITDET_MAX_EVAL_ROIS}"
+echo "MAX_VIDEO_FRAMES: ${MAX_VIDEO_FRAMES}  VITDET_DET_CHUNK: ${VITDET_DET_CHUNK}"
+echo "Python module: ${PYTHON_MODULE}"
 echo "Mode: ${MODE}"
+echo "Resume CKPT: ${CKPT:-none}"
 echo "Data: ${DATA_PATH}"
 echo "Save: ${SAVE_PATH}"
 
@@ -131,10 +173,15 @@ TRAIN_CMD=(
   -enc_layer "${ENC_LAYER}"
   -dec_layer "${DEC_LAYER}"
   -optimizer "${OPTIMIZER}"
+  --backbone "${BACKBONE}"
+  --det_threshold "${DET_THRESHOLD}"
 )
 
 if [[ "${BCE_LOSS}" == "1" ]]; then
   TRAIN_CMD+=(-bce_loss)
+fi
+if [[ -n "${CKPT}" ]]; then
+  TRAIN_CMD+=(-ckpt "${CKPT}")
 fi
 
 srun --ntasks="${WORLD_SIZE}" --ntasks-per-node=1 "${TRAIN_CMD[@]}"

@@ -36,19 +36,31 @@ def _parse_constraints(raw_constraints):
     return parsed
 
 
-def _load_checkpoint_state_dict(path, device):
-    checkpoint = torch.load(path, map_location=device)
-    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-        state_dict = checkpoint['state_dict']
-    elif isinstance(checkpoint, dict):
-        state_dict = checkpoint
-    else:
-        raise RuntimeError('Unsupported checkpoint format at {}'.format(path))
-
-    # Handle checkpoints saved from DDP wrappers.
+def _strip_ddp_prefix(state_dict):
+    if state_dict is None:
+        return None
     if any(k.startswith('module.') for k in state_dict.keys()):
         state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
     return state_dict
+
+
+def _load_checkpoint_state_dicts(path, device):
+    checkpoint = torch.load(path, map_location=device)
+    model_state_dict = None
+    detector_state_dict = None
+
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            model_state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            model_state_dict = checkpoint['state_dict']
+        else:
+            model_state_dict = checkpoint
+        detector_state_dict = checkpoint.get('object_detector_state_dict')
+    else:
+        raise RuntimeError('Unsupported checkpoint format at {}'.format(path))
+
+    return _strip_ddp_prefix(model_state_dict), _strip_ddp_prefix(detector_state_dict)
 
 
 def main():
@@ -71,6 +83,7 @@ def main():
     print('datasize:', conf.datasize)
     print('data_path:', conf.data_path)
     print('model_path:', conf.model_path)
+    print('backbone:', conf.backbone)
     print('eval_workers:', eval_workers)
     print('pin_memory:', pin_memory)
     print('max_test_steps:', max_test_steps)
@@ -90,6 +103,8 @@ def main():
         object_classes=ag_test.object_classes,
         use_SUPPLY=True,
         mode=conf.mode,
+        backbone=conf.backbone,
+        det_threshold=conf.det_threshold,
     ).to(device=device)
     object_detector.eval()
 
@@ -104,8 +119,15 @@ def main():
     ).to(device=device)
     model.eval()
 
-    state_dict = _load_checkpoint_state_dict(conf.model_path, device)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    model_state_dict, detector_state_dict = _load_checkpoint_state_dicts(conf.model_path, device)
+    if detector_state_dict is not None:
+        det_missing_keys, det_unexpected_keys = object_detector.load_state_dict(detector_state_dict, strict=False)
+        if det_missing_keys:
+            print('warning: detector missing keys count:', len(det_missing_keys))
+        if det_unexpected_keys:
+            print('warning: detector unexpected keys count:', len(det_unexpected_keys))
+
+    missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
     if missing_keys:
         print('warning: missing keys count:', len(missing_keys))
     if unexpected_keys:

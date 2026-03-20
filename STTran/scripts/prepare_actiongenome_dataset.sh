@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-PYTHON_MODULE="${PYTHON_MODULE:-python3/3.11.7}"
+PYTHON_MODULE="${PYTHON_MODULE:-python3/3.11.5}"
 VENV_PATH="${VENV_PATH:-$HOME/venvs/sttran311}"
 ACTION_GENOME_REPO="${ACTION_GENOME_REPO:-$HOME/special_topics/ActionGenome}"
 DATASET_ROOT="${DATASET_ROOT:-$HOME/special_topics/datasets/action_genome}"

@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from datetime import timedelta
 import numpy as np
@@ -80,20 +81,175 @@ def _build_loader(dataset, sampler, shuffle, num_workers, pin_memory):
     return DataLoader(dataset, **kwargs)
 
 
-def _optimizer_for(model, conf):
+def _optimizer_for(params, conf):
     if conf.optimizer == 'adamw':
         use_fused = os.environ.get('FUSED_ADAMW', '1') == '1'
         if use_fused:
             try:
-                return optim.AdamW(model.parameters(), lr=conf.lr, fused=True)
+                return optim.AdamW(params, lr=conf.lr, fused=True)
             except Exception:
                 pass
-        return AdamW(model.parameters(), lr=conf.lr)
+        return AdamW(params, lr=conf.lr)
     if conf.optimizer == 'adam':
-        return optim.Adam(model.parameters(), lr=conf.lr)
+        return optim.Adam(params, lr=conf.lr)
     if conf.optimizer == 'sgd':
-        return optim.SGD(model.parameters(), lr=conf.lr, momentum=0.9, weight_decay=0.01)
+        return optim.SGD(params, lr=conf.lr, momentum=0.9, weight_decay=0.01)
     raise ValueError('Unknown optimizer {}'.format(conf.optimizer))
+
+
+def _unwrap(module):
+    return module.module if hasattr(module, 'module') else module
+
+
+def _split_detector_params(detector_module):
+    vit_params = []
+    detector_task_params = []
+    for name, param in detector_module.named_parameters():
+        if not param.requires_grad:
+            continue
+        lname = name.lower()
+        if 'vitdet' in lname and 'backbone' in lname:
+            vit_params.append(param)
+        else:
+            detector_task_params.append(param)
+    return vit_params, detector_task_params
+
+
+def _build_train_optimizer(model, object_detector, conf, train_detector):
+    if not train_detector:
+        optimizer = _optimizer_for(model.parameters(), conf)
+        return optimizer, {
+            'train_detector': False,
+            'vit_lr': None,
+            'task_lr': conf.lr,
+            'vit_param_tensors': 0,
+            'task_param_tensors': sum(1 for _ in model.parameters()),
+        }
+
+    detector_module = _unwrap(object_detector)
+    vit_params, detector_task_params = _split_detector_params(detector_module)
+    model_params = [p for p in model.parameters() if p.requires_grad]
+    task_params = detector_task_params + model_params
+
+    vit_lr = float(os.environ.get('VIT_LR', str(conf.lr)))
+    task_lr = float(os.environ.get('TASK_LR', '1e-4'))
+    weight_decay = float(os.environ.get('WEIGHT_DECAY', '1e-4'))
+
+    param_groups = []
+    if vit_params:
+        param_groups.append({'params': vit_params, 'lr': vit_lr})
+    if task_params:
+        param_groups.append({'params': task_params, 'lr': task_lr})
+
+    if not param_groups:
+        raise RuntimeError('No trainable parameters found for differential optimizer.')
+
+    optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+    return optimizer, {
+        'train_detector': True,
+        'vit_lr': vit_lr,
+        'task_lr': task_lr,
+        'weight_decay': weight_decay,
+        'vit_param_tensors': len(vit_params),
+        'task_param_tensors': len(task_params),
+    }
+
+
+def _params_for_grad_clip(optimizer):
+    params = []
+    for group in optimizer.param_groups:
+        for param in group['params']:
+            if param.requires_grad:
+                params.append(param)
+    return params
+
+
+def _strip_ddp_prefix(state_dict):
+    if state_dict is None:
+        return None
+    if any(k.startswith('module.') for k in state_dict.keys()):
+        state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _infer_epoch_from_path(path):
+    name = os.path.basename(path)
+    match = re.search(r'sttran_epoch_(\d+)\.pth$', name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _load_resume_checkpoint(conf, model, object_detector, optimizer, scheduler, device, is_main):
+    if not conf.ckpt:
+        return 0
+    ckpt_path = conf.ckpt
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError('Resume checkpoint not found: {}'.format(ckpt_path))
+
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model_state_dict = None
+    detector_state_dict = None
+    optimizer_state_dict = None
+    scheduler_state_dict = None
+    ckpt_epoch = None
+
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            model_state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            model_state_dict = checkpoint['state_dict']
+        else:
+            # Legacy checkpoint format: plain model state_dict
+            model_state_dict = checkpoint
+        detector_state_dict = checkpoint.get('object_detector_state_dict')
+        optimizer_state_dict = checkpoint.get('optimizer_state_dict')
+        scheduler_state_dict = checkpoint.get('scheduler_state_dict')
+        ckpt_epoch = checkpoint.get('epoch')
+    else:
+        raise RuntimeError('Unsupported checkpoint format at {}'.format(ckpt_path))
+
+    model_state_dict = _strip_ddp_prefix(model_state_dict)
+    detector_state_dict = _strip_ddp_prefix(detector_state_dict)
+
+    model_module = _unwrap(model)
+    detector_module = _unwrap(object_detector)
+
+    missing_keys, unexpected_keys = model_module.load_state_dict(model_state_dict, strict=False)
+    if is_main:
+        print('resume model missing_keys:', len(missing_keys))
+        print('resume model unexpected_keys:', len(unexpected_keys))
+
+    if detector_state_dict is not None:
+        det_missing_keys, det_unexpected_keys = detector_module.load_state_dict(detector_state_dict, strict=False)
+        if is_main:
+            print('resume detector missing_keys:', len(det_missing_keys))
+            print('resume detector unexpected_keys:', len(det_unexpected_keys))
+
+    if optimizer_state_dict is not None:
+        try:
+            optimizer.load_state_dict(optimizer_state_dict)
+            if is_main:
+                print('resume optimizer: loaded')
+        except Exception as exc:
+            if is_main:
+                print('resume optimizer: skipped ({})'.format(exc))
+    if scheduler is not None and scheduler_state_dict is not None:
+        try:
+            scheduler.load_state_dict(scheduler_state_dict)
+            if is_main:
+                print('resume scheduler: loaded')
+        except Exception as exc:
+            if is_main:
+                print('resume scheduler: skipped ({})'.format(exc))
+
+    if ckpt_epoch is None:
+        ckpt_epoch = _infer_epoch_from_path(ckpt_path)
+    start_epoch = int(ckpt_epoch) + 1 if ckpt_epoch is not None else 0
+    if is_main:
+        print('resuming from checkpoint:', ckpt_path)
+        print('resume start_epoch:', start_epoch)
+    return start_epoch
 
 
 def main():
@@ -107,16 +263,28 @@ def main():
 
     amp_enabled = os.environ.get('AMP', '1') == '1' and gpu_device.type == 'cuda'
     amp_dtype_name = os.environ.get('AMP_DTYPE', 'bf16').lower()
-    if amp_dtype_name in ('bf16', 'bfloat16') and torch.cuda.is_bf16_supported():
+    if gpu_device.type == 'cuda' and amp_dtype_name in ('bf16', 'bfloat16') and torch.cuda.is_bf16_supported():
         amp_dtype = torch.bfloat16
     else:
         amp_dtype = torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
-    max_train_steps = int(os.environ.get('MAX_TRAIN_STEPS', '-1'))
-    max_test_steps = int(os.environ.get('MAX_TEST_STEPS', '-1'))
+    if conf.max_train_steps is not None:
+        max_train_steps = int(conf.max_train_steps)
+    else:
+        max_train_steps = int(os.environ.get('MAX_TRAIN_STEPS', '-1'))
+    if conf.max_test_steps is not None:
+        max_test_steps = int(conf.max_test_steps)
+    else:
+        max_test_steps = int(os.environ.get('MAX_TEST_STEPS', '-1'))
     run_eval = os.environ.get('RUN_EVAL', '0') == '1'
     ckpt_every = max(1, int(os.environ.get('CKPT_EVERY', '2')))
     eval_every = max(1, int(os.environ.get('EVAL_EVERY', '1')))
+    train_detector_default = '1' if conf.backbone.lower() == 'vitdet' else '0'
+    train_detector = os.environ.get('TRAIN_DETECTOR', train_detector_default) == '1'
+    if conf.mode != 'sgdet':
+        train_detector = False
+    max_video_frames_default = '24' if train_detector else '-1'
+    max_video_frames = int(os.environ.get('MAX_VIDEO_FRAMES', max_video_frames_default))
 
     # Rank-0-only eval inside DDP causes other ranks to wait in collectives and can
     # trigger NCCL watchdog timeouts on long validation loops.
@@ -139,6 +307,8 @@ def main():
         print('ddp_timeout_sec: {}'.format(pg_timeout_seconds))
         print('max_train_steps: {}  max_test_steps: {}'.format(max_train_steps, max_test_steps))
         print('run_eval: {}  ckpt_every: {}  eval_every: {}'.format(run_eval, ckpt_every, eval_every))
+        print('train_detector: {}'.format(train_detector))
+        print('max_video_frames: {}'.format(max_video_frames))
 
     AG_dataset_train = AG(
         mode='train',
@@ -190,8 +360,20 @@ def main():
         object_classes=AG_dataset_train.object_classes,
         use_SUPPLY=True,
         mode=conf.mode,
+        backbone=conf.backbone,
+        det_threshold=conf.det_threshold,
     ).to(device=gpu_device)
-    object_detector.eval()
+    if is_distributed and train_detector:
+        object_detector = DDP(
+            object_detector,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+    if train_detector:
+        object_detector.train()
+    else:
+        object_detector.eval()
 
     model = STTran(
         mode=conf.mode,
@@ -225,7 +407,22 @@ def main():
     else:
         mlm_loss = nn.MultiLabelMarginLoss()
 
-    optimizer = _optimizer_for(model, conf)
+    optimizer, optimizer_info = _build_train_optimizer(
+        model=model,
+        object_detector=object_detector,
+        conf=conf,
+        train_detector=train_detector,
+    )
+    clip_params = _params_for_grad_clip(optimizer)
+    if is_main:
+        print('optimizer train_detector: {}'.format(optimizer_info['train_detector']))
+        print('optimizer vit_lr: {} task_lr: {}'.format(optimizer_info['vit_lr'], optimizer_info['task_lr']))
+        print(
+            'optimizer param groups (vit/task tensors): {}/{}'.format(
+                optimizer_info['vit_param_tensors'],
+                optimizer_info['task_param_tensors'],
+            )
+        )
     scheduler = None
     if run_eval:
         scheduler = ReduceLROnPlateau(
@@ -239,12 +436,33 @@ def main():
             min_lr=1e-7,
         )
 
-    for epoch in range(conf.nepoch):
+    start_epoch = _load_resume_checkpoint(
+        conf=conf,
+        model=model,
+        object_detector=object_detector,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=gpu_device,
+        is_main=is_main,
+    )
+    if start_epoch >= conf.nepoch and is_main:
+        print(
+            'resume start_epoch {} >= nepoch {}; no training iterations will run.'.format(
+                start_epoch, conf.nepoch
+            )
+        )
+
+    for epoch in range(start_epoch, conf.nepoch):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         model.train()
-        object_detector.is_train = True
+        detector_module = _unwrap(object_detector)
+        detector_module.is_train = True
+        if train_detector:
+            object_detector.train()
+        else:
+            object_detector.eval()
         start = time.time()
         tr = []
 
@@ -256,10 +474,20 @@ def main():
             gt_boxes = data[2].to(device=gpu_device, non_blocking=True)
             num_boxes = data[3].to(device=gpu_device, non_blocking=True)
             gt_annotation = AG_dataset_train.gt_annotations[data[4]]
+            if max_video_frames > 0 and im_data.shape[0] > max_video_frames:
+                im_data = im_data[:max_video_frames]
+                im_info = im_info[:max_video_frames]
+                gt_boxes = gt_boxes[:max_video_frames]
+                num_boxes = num_boxes[:max_video_frames]
+                gt_annotation = gt_annotation[:max_video_frames]
 
-            # prevent gradients to FasterRCNN
-            with torch.no_grad():
-                entry = object_detector(im_data, im_info, gt_boxes, num_boxes, gt_annotation, im_all=None)
+            if train_detector:
+                with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
+                    entry = object_detector(im_data, im_info, gt_boxes, num_boxes, gt_annotation, im_all=None)
+            else:
+                # Keep detector frozen for baseline/resnet runs unless explicitly enabled.
+                with torch.no_grad():
+                    entry = object_detector(im_data, im_info, gt_boxes, num_boxes, gt_annotation, im_all=None)
 
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
                 pred = model(entry)
@@ -302,12 +530,12 @@ def main():
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5, norm_type=2)
+                torch.nn.utils.clip_grad_norm_(clip_params, max_norm=5, norm_type=2)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5, norm_type=2)
+                torch.nn.utils.clip_grad_norm_(clip_params, max_norm=5, norm_type=2)
                 optimizer.step()
 
             if is_main:
@@ -328,10 +556,24 @@ def main():
                     start = time.time()
 
         model_to_save = model.module if hasattr(model, 'module') else model
+        detector_to_save = _unwrap(object_detector)
         should_save = (epoch % ckpt_every == 0) or (epoch == conf.nepoch - 1)
         if is_main and should_save:
             checkpoint_path = os.path.join(conf.save_path, 'sttran_epoch_{}.pth'.format(epoch))
-            torch.save(model_to_save.state_dict(), checkpoint_path)
+            checkpoint_payload = {
+                'state_dict': model_to_save.state_dict(),
+                'model_state_dict': model_to_save.state_dict(),
+                'train_detector': bool(train_detector),
+                'epoch': epoch,
+                'backbone': conf.backbone,
+                'det_threshold': conf.det_threshold,
+                'optimizer_state_dict': optimizer.state_dict(),
+            }
+            if scheduler is not None:
+                checkpoint_payload['scheduler_state_dict'] = scheduler.state_dict()
+            if train_detector:
+                checkpoint_payload['object_detector_state_dict'] = detector_to_save.state_dict()
+            torch.save(checkpoint_payload, checkpoint_path)
             print('*' * 40)
             print('saved checkpoint: {}'.format(checkpoint_path))
 
@@ -348,7 +590,9 @@ def main():
             continue
 
         model.eval()
-        object_detector.is_train = False
+        detector_module = _unwrap(object_detector)
+        detector_module.is_train = False
+        object_detector.eval()
 
         score = 0.0
         if is_main:

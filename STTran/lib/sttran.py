@@ -82,6 +82,27 @@ class ObjectClassifier(nn.Module):
         entry['pred_labels'] = torch.cat(final_labels, dim=0)
         return entry
 
+    def _set_empty_relations(self, entry, device):
+        # Keep tensor shapes explicit so downstream evaluator logic can handle
+        # "no relations in this frame" without shape/index errors.
+        box_dtype = entry['boxes'].dtype if 'boxes' in entry else torch.float32
+        entry['pair_idx'] = torch.empty((0, 2), dtype=torch.long, device=device)
+        entry['im_idx'] = torch.empty((0,), dtype=torch.float, device=device)
+        entry['union_feat'] = torch.empty((0, 1024, 7, 7), dtype=torch.float, device=device)
+        entry['union_box'] = torch.empty((0, 5), dtype=box_dtype, device=device)
+        entry['spatial_masks'] = torch.empty((0, 2, 27, 27), dtype=torch.float, device=device)
+        if 'pred_labels' not in entry:
+            if 'labels' in entry:
+                entry['pred_labels'] = entry['labels']
+            else:
+                entry['pred_labels'] = torch.empty((0,), dtype=torch.long, device=device)
+        if 'pred_scores' not in entry:
+            if 'scores' in entry:
+                entry['pred_scores'] = entry['scores']
+            else:
+                entry['pred_scores'] = torch.empty((0,), dtype=torch.float, device=device)
+        return entry
+
     def forward(self, entry):
 
         if self.mode  == 'predcls':
@@ -99,6 +120,8 @@ class ObjectClassifier(nn.Module):
                 entry['distribution'] = self.decoder_lin(obj_features)
 
                 box_idx = entry['boxes'][:,0].long()
+                if box_idx.numel() == 0:
+                    return self._set_empty_relations(entry, obj_features.device)
                 b = int(box_idx[-1] + 1)
 
                 entry['distribution'] = torch.softmax(entry['distribution'][:, 1:], dim=1)
@@ -139,7 +162,10 @@ class ObjectClassifier(nn.Module):
                         im_idx.append(j)
                         pair.append([int(i), int(m)])
 
-                pair = torch.tensor(pair).to(obj_features.device)
+                if len(pair) == 0:
+                    return self._set_empty_relations(entry, obj_features.device)
+
+                pair = torch.tensor(pair, dtype=torch.long).to(obj_features.device)
                 im_idx = torch.tensor(im_idx, dtype=torch.float).to(obj_features.device)
                 entry['pair_idx'] = pair
                 entry['im_idx'] = im_idx
@@ -176,6 +202,8 @@ class ObjectClassifier(nn.Module):
                 obj_features = torch.cat((entry['features'], obj_embed, pos_embed), 1) #use the result from FasterRCNN directly
 
                 box_idx = entry['boxes'][:, 0].long()
+                if box_idx.numel() == 0:
+                    return self._set_empty_relations(entry, obj_features.device)
                 b = int(box_idx[-1] + 1)
 
                 entry = self.clean_class(entry, b, 5)
@@ -240,7 +268,10 @@ class ObjectClassifier(nn.Module):
                         im_idx.append(j)
                         pair.append([int(i), int(m)])
 
-                pair = torch.tensor(pair).to(box_idx.device)
+                if len(pair) == 0:
+                    return self._set_empty_relations(entry, box_idx.device)
+
+                pair = torch.tensor(pair, dtype=torch.long).to(box_idx.device)
                 im_idx = torch.tensor(im_idx, dtype=torch.float).to(box_idx.device)
                 entry['pair_idx'] = pair
                 entry['im_idx'] = im_idx
@@ -316,6 +347,12 @@ class STTran(nn.Module):
     def forward(self, entry):
 
         entry = self.object_classifier(entry)
+        if ('pair_idx' not in entry) or entry['pair_idx'].numel() == 0:
+            device = entry['boxes'].device
+            entry["attention_distribution"] = torch.empty((0, self.attention_class_num), device=device)
+            entry["spatial_distribution"] = torch.empty((0, self.spatial_class_num), device=device)
+            entry["contacting_distribution"] = torch.empty((0, self.contact_class_num), device=device)
+            return entry
 
         # visual part
         subj_rep = entry['features'][entry['pair_idx'][:, 0]]
