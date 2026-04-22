@@ -17,7 +17,7 @@ class Config(object):
         self.ckpt = None
         self.optimizer = None
         self.bce_loss = None
-        self.lr = 1e-5
+        self.lr = 1e-6
         self.enc_layer = 1
         self.dec_layer = 3
         self.nepoch = 10
@@ -38,7 +38,7 @@ class Config(object):
         parser.add_argument('-datasize', '--datasize', dest='datasize', help='mini dataset or whole', default='large', type=str)
         parser.add_argument('-ckpt', '--ckpt', dest='ckpt', help='checkpoint', default=None, type=str)
         parser.add_argument('-optimizer', '--optimizer', help='adamw/adam/sgd', default='adamw', type=str)
-        parser.add_argument('-lr', '--lr', dest='lr', help='learning rate', default=1e-5, type=float)
+        parser.add_argument('-lr', '--lr', dest='lr', help='learning rate', default=1e-6, type=float)
         parser.add_argument('-nepoch', '--nepoch', help='epoch number', default=10, type=int)
         parser.add_argument('-enc_layer', '--enc_layer', dest='enc_layer', help='spatial encoder layer', default=1, type=int)
         parser.add_argument('-dec_layer', '--dec_layer', dest='dec_layer', help='temporal decoder layer', default=3, type=int)

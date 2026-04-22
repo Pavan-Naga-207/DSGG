@@ -1,9 +1,10 @@
 import math
+import os
 from typing import Dict, Tuple
 
 import timm
 import torch
-from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from timm.data import resolve_data_config
 from torch import nn, Tensor
 import torch.nn.functional as F
 
@@ -28,12 +29,15 @@ class SimpleViTDetFPN(nn.Module):
         self.align_channels = align_channels
         self.use_align = use_align
 
-        # Backbone: MAE/ViT pretrain, classification head removed.
         self.backbone = timm.create_model(
             model_name,
             pretrained=True,
             num_classes=0,
         )
+        try:
+            self.data_cfg = resolve_data_config({}, model=self.backbone)
+        except TypeError:
+            self.data_cfg = resolve_data_config(self.backbone.pretrained_cfg)
         if not hasattr(self.backbone, "patch_embed"):
             raise RuntimeError(f"{model_name} missing patch_embed; expected a ViT-like model.")
 
@@ -48,12 +52,24 @@ class SimpleViTDetFPN(nn.Module):
             self.backbone.pos_embed.detach().clone() if hasattr(self.backbone, "pos_embed") else torch.empty(0),
             persistent=False,
         )
+        self.default_input_size = int(os.environ.get("VIT_INPUT_SIZE", "0"))
+        if self.default_input_size > 0:
+            self.default_input_size = int(
+                math.ceil(float(self.default_input_size) / float(self.patch_size)) * self.patch_size
+            )
 
-        # Normalization to match ViT pretraining stats.
-        self.register_buffer("pixel_mean", torch.tensor(IMAGENET_DEFAULT_MEAN).view(1, 3, 1, 1), persistent=False)
-        self.register_buffer("pixel_std", torch.tensor(IMAGENET_DEFAULT_STD).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor(self.data_cfg.get("mean", (0.5, 0.5, 0.5))).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor(self.data_cfg.get("std", (0.5, 0.5, 0.5))).view(1, 3, 1, 1),
+            persistent=False,
+        )
 
-        # Simple 1x1 alignment to the expected detector head depth.
+
         if self.use_align:
             self.align_layers = nn.ModuleDict(
                 {level: nn.Conv2d(out_channels, align_channels, kernel_size=1) for level in ("p2", "p3", "p4", "p5")}
@@ -61,8 +77,7 @@ class SimpleViTDetFPN(nn.Module):
         else:
             self.align_layers = None
 
-        # FPN heads: start from the 1/16 grid; upsample for p2, lateral for p3,
-        # downsample for p4/p5. Keep channel count small to manage H100 memory.
+
         self.p2 = nn.Sequential(
             nn.ConvTranspose2d(self.embed_dim, out_channels, kernel_size=2, stride=2),
             nn.GELU(),
@@ -86,15 +101,17 @@ class SimpleViTDetFPN(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
+        if self.default_input_size > 0:
+            self._set_backbone_grid(self.default_input_size, self.default_input_size)
+            self._maybe_resize_pos_embed()
+
     def _reshape_tokens(self, tokens: Tensor, height: int, width: int) -> Tensor:
-        """
-        tokens: [B, N, C] without CLS. Convert to [B, C, H/patch, W/patch].
-        """
+
         b, n, c = tokens.shape
         grid_h = height // self.patch_size
         grid_w = width // self.patch_size
         if grid_h * grid_w != n:
-            # Fall back to square inference from token count.
+
             side = int(math.sqrt(n))
             if side * side != n:
                 raise RuntimeError(f"Token count {n} not square; cannot reshape to grid.")
@@ -118,48 +135,55 @@ class SimpleViTDetFPN(nn.Module):
         grid = grid.permute(0, 2, 3, 1).reshape(1, new_grid_size[0] * new_grid_size[1], -1)
         return torch.cat([prefix, grid], dim=1)
 
+    def _set_backbone_grid(self, height: int, width: int) -> None:
+        if not hasattr(self.backbone, "patch_embed"):
+            return
+        pe = self.backbone.patch_embed
+        grid_h = height // self.patch_size
+        grid_w = width // self.patch_size
+        if hasattr(pe, "img_size"):
+            pe.img_size = (height, width)
+        if hasattr(pe, "grid_size"):
+            pe.grid_size = (grid_h, grid_w)
+        if hasattr(pe, "num_patches"):
+            pe.num_patches = grid_h * grid_w
+
+    def _maybe_resize_pos_embed(self) -> None:
+        if not hasattr(self.backbone, "pos_embed"):
+            return
+        pos_embed = self.backbone.pos_embed
+        num_prefix = getattr(self.backbone, "num_prefix_tokens", 1)
+        num_patches = getattr(self.backbone.patch_embed, "num_patches", None)
+        if num_patches is None:
+            return
+        target_tokens = num_prefix + num_patches
+        if pos_embed.shape[1] == target_tokens:
+            return
+        source = self._base_pos_embed.to(
+            device=pos_embed.device,
+            dtype=pos_embed.dtype,
+        )
+        resized = self._resize_abs_pos_embed(
+            source_pos_embed=source,
+            num_prefix_tokens=num_prefix,
+            old_grid_size=self._base_grid_size,
+            new_grid_size=self.backbone.patch_embed.grid_size,
+        )
+        self.backbone.pos_embed = nn.Parameter(resized)
+
     def forward(self, images: Tensor) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
-        """
-        Args:
-            images: float tensor [B, 3, H, W] in range 0-1 or 0-255.
-        Returns:
-            aligned: dict of aligned feature maps (p2..p5) with channel=align_channels when use_align is True.
-            raw: dict of raw pyramid maps (channel=out_channels).
-        """
         if images.dtype != torch.float32:
             images = images.float()
+       
+        needs_rescale = (images.amax(dim=(1, 2, 3), keepdim=True) > 1.5).to(images.dtype)
+        images = images / (1.0 + needs_rescale * 254.0)
         x = (images - self.pixel_mean) / self.pixel_std
 
         h, w = images.shape[2], images.shape[3]
-        # Allow variable input sizes by updating patch_embed metadata.
-        if hasattr(self.backbone, "patch_embed"):
-            pe = self.backbone.patch_embed
-            if hasattr(pe, "img_size"):
-                pe.img_size = (h, w)
-            if hasattr(pe, "grid_size"):
-                pe.grid_size = (h // self.patch_size, w // self.patch_size)
-            if hasattr(pe, "num_patches"):
-                pe.num_patches = pe.grid_size[0] * pe.grid_size[1]
 
-        # Resize positional embeddings if the token count changes.
-        if hasattr(self.backbone, "pos_embed"):
-            pos_embed = self.backbone.pos_embed
-            num_prefix = getattr(self.backbone, "num_prefix_tokens", 1)
-            num_patches = getattr(self.backbone.patch_embed, "num_patches", None)
-            if num_patches is not None:
-                target_tokens = num_prefix + num_patches
-                if pos_embed.shape[1] != target_tokens:
-                    source = self._base_pos_embed.to(
-                        device=pos_embed.device,
-                        dtype=pos_embed.dtype,
-                    )
-                    resized = self._resize_abs_pos_embed(
-                        source_pos_embed=source,
-                        num_prefix_tokens=num_prefix,
-                        old_grid_size=self._base_grid_size,
-                        new_grid_size=self.backbone.patch_embed.grid_size,
-                    )
-                    self.backbone.pos_embed = nn.Parameter(resized)
+        self._set_backbone_grid(h, w)
+
+        self._maybe_resize_pos_embed()
 
         features = self.backbone.forward_features(x)
         tokens = None
@@ -172,9 +196,6 @@ class SimpleViTDetFPN(nn.Module):
         if tokens is None or tokens.dim() != 3:
             raise RuntimeError(f"Unexpected feature output from {self.model_name}: {type(features)}")
 
-        # Drop CLS token if present.
-        # Drop prefix tokens (e.g., CLS). Timm ViTs usually expose num_prefix_tokens and
-        # patch_embed.num_patches.
         num_prefix = getattr(self.backbone, "num_prefix_tokens", 1)
         num_patches = getattr(self.backbone.patch_embed, "num_patches", None)
         expected = None
@@ -205,9 +226,7 @@ def build_vitdet_bridge(
     freeze_backbone: bool = True,
     use_align: bool = True,
 ) -> SimpleViTDetFPN:
-    """
-    Convenience factory to mirror the existing detector build pattern.
-    """
+
     return SimpleViTDetFPN(
         model_name=model_name,
         out_channels=out_channels,
@@ -215,4 +234,3 @@ def build_vitdet_bridge(
         freeze_backbone=freeze_backbone,
         use_align=use_align,
     )
-

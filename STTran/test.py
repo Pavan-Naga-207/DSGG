@@ -15,11 +15,17 @@ for i in conf.args:
     print(i,':', conf.args[i])
 
 AG_dataset = AG(mode="test", datasize=conf.datasize, data_path=conf.data_path, filter_nonperson_box_frame=True,
-                filter_small_box=False if conf.mode == 'predcls' else True)
+                filter_small_box=False if conf.mode == 'predcls' else True, backbone=conf.backbone)
 dataloader = torch.utils.data.DataLoader(AG_dataset, shuffle=False, num_workers=0, collate_fn=cuda_collate_fn)
 
 gpu_device = torch.device('cuda:0')
-object_detector = detector(train=False, object_classes=AG_dataset.object_classes, use_SUPPLY=True, mode=conf.mode).to(device=gpu_device)
+object_detector = detector(
+    train=False,
+    object_classes=AG_dataset.object_classes,
+    use_SUPPLY=True,
+    mode=conf.mode,
+    backbone=conf.backbone,
+).to(device=gpu_device)
 object_detector.eval()
 
 

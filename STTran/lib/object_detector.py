@@ -12,6 +12,7 @@ from lib.draw_rectangles.draw_rectangles import draw_union_boxes
 from fasterRCNN.lib.model.faster_rcnn.resnet import resnet
 from fasterRCNN.lib.model.rpn.bbox_transform import bbox_transform_inv, clip_boxes
 from fasterRCNN.lib.model.roi_layers import nms
+from fasterRCNN.lib.model.utils.net_utils import _smooth_l1_loss
 try:
     from phase2_vitdet.adapter import ViTDetBackbone
 except ImportError:
@@ -19,6 +20,93 @@ except ImportError:
     if _special_topics_root not in sys.path:
         sys.path.insert(0, _special_topics_root)
     from phase2_vitdet.adapter import ViTDetBackbone
+
+
+def _valid_group_count(num_channels, preferred_groups):
+    groups = min(max(1, int(preferred_groups)), int(num_channels))
+    while groups > 1 and num_channels % groups != 0:
+        groups -= 1
+    return groups
+
+
+def _replace_batchnorm_with_groupnorm(module, preferred_groups=32):
+    replaced = 0
+    for child_name, child in list(module.named_children()):
+        replaced += _replace_batchnorm_with_groupnorm(child, preferred_groups=preferred_groups)
+        if isinstance(child, nn.BatchNorm2d):
+            num_groups = _valid_group_count(child.num_features, preferred_groups)
+            gn = nn.GroupNorm(
+                num_groups=num_groups,
+                num_channels=child.num_features,
+                eps=child.eps,
+                affine=child.affine,
+            )
+            if child.affine:
+                with torch.no_grad():
+                    gn.weight.copy_(child.weight)
+                    gn.bias.copy_(child.bias)
+            setattr(module, child_name, gn)
+            replaced += 1
+    return replaced
+
+
+def _freeze_batchnorm_stats(module):
+    frozen = 0
+    for child in module.modules():
+        if isinstance(child, nn.BatchNorm2d):
+            child.eval()
+            if child.affine:
+                child.weight.requires_grad_(False)
+                child.bias.requires_grad_(False)
+            frozen += 1
+    return frozen
+
+
+def _reset_linear_head(linear_layer, init_std):
+    if linear_layer is None:
+        return
+    nn.init.normal_(linear_layer.weight, mean=0.0, std=init_std)
+    if linear_layer.bias is not None:
+        nn.init.constant_(linear_layer.bias, 0.0)
+
+
+def _reset_detector_prediction_heads(detector_module):
+    _reset_linear_head(detector_module.RCNN_cls_score, init_std=0.01)
+    _reset_linear_head(detector_module.RCNN_bbox_pred, init_std=0.001)
+
+
+def _box_area(boxes):
+    widths = (boxes[:, 2] - boxes[:, 0]).clamp(min=0.0)
+    heights = (boxes[:, 3] - boxes[:, 1]).clamp(min=0.0)
+    return widths * heights
+
+
+def _aligned_giou_loss(pred_boxes, target_boxes):
+    if pred_boxes.numel() == 0 or target_boxes.numel() == 0:
+        return pred_boxes.sum() * 0.0
+
+    inter_x1 = torch.maximum(pred_boxes[:, 0], target_boxes[:, 0])
+    inter_y1 = torch.maximum(pred_boxes[:, 1], target_boxes[:, 1])
+    inter_x2 = torch.minimum(pred_boxes[:, 2], target_boxes[:, 2])
+    inter_y2 = torch.minimum(pred_boxes[:, 3], target_boxes[:, 3])
+
+    inter_w = (inter_x2 - inter_x1).clamp(min=0.0)
+    inter_h = (inter_y2 - inter_y1).clamp(min=0.0)
+    inter_area = inter_w * inter_h
+
+    pred_area = _box_area(pred_boxes)
+    target_area = _box_area(target_boxes)
+    union = pred_area + target_area - inter_area
+    iou = inter_area / union.clamp(min=torch.finfo(pred_boxes.dtype).eps)
+
+    enc_x1 = torch.minimum(pred_boxes[:, 0], target_boxes[:, 0])
+    enc_y1 = torch.minimum(pred_boxes[:, 1], target_boxes[:, 1])
+    enc_x2 = torch.maximum(pred_boxes[:, 2], target_boxes[:, 2])
+    enc_y2 = torch.maximum(pred_boxes[:, 3], target_boxes[:, 3])
+    enc_area = ((enc_x2 - enc_x1).clamp(min=0.0) * (enc_y2 - enc_y1).clamp(min=0.0))
+    giou = iou - ((enc_area - union) / enc_area.clamp(min=torch.finfo(pred_boxes.dtype).eps))
+    return (1.0 - giou).mean()
+
 
 class detector(nn.Module):
 
@@ -48,13 +136,74 @@ class detector(nn.Module):
         self.max_train_rois = int(os.environ.get('VITDET_MAX_TRAIN_ROIS', '256'))
         self.max_eval_rois = int(os.environ.get('VITDET_MAX_EVAL_ROIS', '1000'))
         self.detector_chunk = max(1, int(os.environ.get('VITDET_DET_CHUNK', '10')))
+        self.detector_cls_loss = os.environ.get('DETECTOR_CLS_LOSS', 'ce').strip().lower()
+        if self.detector_cls_loss not in ('ce', 'weighted_ce'):
+            raise ValueError(
+                'Unsupported DETECTOR_CLS_LOSS: {} (expected ce or weighted_ce)'.format(
+                    self.detector_cls_loss
+                )
+            )
+        self.detector_bbox_loss = os.environ.get('DETECTOR_BBOX_LOSS', 'smoothl1').strip().lower()
+        if self.detector_bbox_loss not in ('smoothl1', 'smooth_l1', 'giou'):
+            raise ValueError(
+                'Unsupported DETECTOR_BBOX_LOSS: {} (expected smoothl1 or giou)'.format(
+                    self.detector_bbox_loss
+                )
+            )
+        self.rcnn_cls_weights = None
         if self.backbone_name not in ('resnet101', 'vitdet'):
             raise ValueError('Unsupported backbone: {}. Expected resnet101 or vitdet'.format(backbone))
 
         self.fasterRCNN = resnet(classes=self.object_classes, num_layers=101, pretrained=False, class_agnostic=False)
         self.fasterRCNN.create_architecture()
-        checkpoint = torch.load('fasterRCNN/models/faster_rcnn_ag.pth', map_location='cpu')
-        self.fasterRCNN.load_state_dict(checkpoint['model'])
+        load_ag_ckpt = os.environ.get('DETECTOR_LOAD_AG_CKPT', '1') == '1'
+        skip_ag_head_load = os.environ.get('DETECTOR_SKIP_AG_HEAD_LOAD', '0') == '1'
+        reinit_roi_heads = os.environ.get('DETECTOR_REINIT_ROI_HEADS', '0') == '1'
+        if load_ag_ckpt:
+            checkpoint = torch.load('fasterRCNN/models/faster_rcnn_ag.pth', map_location='cpu')
+            detector_state = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+            if skip_ag_head_load:
+                head_prefixes = ('RCNN_cls_score.', 'RCNN_bbox_pred.')
+                original_key_count = len(detector_state)
+                detector_state = {
+                    key: value
+                    for key, value in detector_state.items()
+                    if not any(key.startswith(prefix) for prefix in head_prefixes)
+                }
+                skipped_keys = original_key_count - len(detector_state)
+                print('detector init: skipped AG detector head keys:', skipped_keys)
+            missing_keys, unexpected_keys = self.fasterRCNN.load_state_dict(detector_state, strict=False)
+            print(
+                'detector init: AG checkpoint load missing/unexpected keys: {}/{}'.format(
+                    len(missing_keys),
+                    len(unexpected_keys),
+                )
+            )
+        else:
+            print('detector init: DETECTOR_LOAD_AG_CKPT=0; skipping AG detector checkpoint load.')
+        if reinit_roi_heads:
+            _reset_detector_prediction_heads(self.fasterRCNN)
+            print('detector init: reinitialized RCNN_cls_score and RCNN_bbox_pred heads.')
+        detector_bn_mode = os.environ.get('DETECTOR_BN_MODE', 'batchnorm').strip().lower()
+        detector_gn_groups = int(os.environ.get('DETECTOR_GN_GROUPS', '32'))
+        if detector_bn_mode == 'groupnorm':
+            replaced_bn = _replace_batchnorm_with_groupnorm(
+                self.fasterRCNN, preferred_groups=detector_gn_groups
+            )
+            print(
+                'detector norm mode: groupnorm (groups={}); replaced BatchNorm2d layers: {}'.format(
+                    detector_gn_groups, replaced_bn
+                )
+            )
+        elif detector_bn_mode in ('frozen', 'frozenbn', 'frozen_batchnorm'):
+            frozen_bn = _freeze_batchnorm_stats(self.fasterRCNN)
+            print('detector norm mode: frozen batchnorm; frozen BatchNorm2d layers: {}'.format(frozen_bn))
+        elif detector_bn_mode not in ('batchnorm', 'bn'):
+            raise ValueError(
+                'Unsupported DETECTOR_BN_MODE: {} (expected batchnorm, groupnorm, or frozen)'.format(
+                    detector_bn_mode
+                )
+            )
 
         self.ROI_Align = copy.deepcopy(self.fasterRCNN.RCNN_roi_align)
         self.RCNN_Head = copy.deepcopy(self.fasterRCNN._head_to_tail)
@@ -68,6 +217,175 @@ class detector(nn.Module):
                 align_channels=int(os.environ.get('VITDET_ALIGN_CHANNELS', '1024')),
                 freeze_backbone=os.environ.get('VITDET_FREEZE', '1') == '1',
             )
+        print(
+            'detector pretrain losses: cls={} bbox={}'.format(
+                self.detector_cls_loss, self.detector_bbox_loss
+            )
+        )
+
+    def set_rcnn_class_weights(self, class_weights):
+        if class_weights is None:
+            self.rcnn_cls_weights = None
+            return
+        if not torch.is_tensor(class_weights):
+            class_weights = torch.as_tensor(class_weights, dtype=torch.float32)
+        self.rcnn_cls_weights = class_weights.detach().float()
+
+    def _extract_base_features(self, images):
+        if self.backbone_name == 'vitdet':
+            feat_dict = self.vitdet(images)
+            return feat_dict['base']
+        return self.fasterRCNN.RCNN_base(images)
+
+    def _ensure_scalar_tensor(self, value, device, dtype=torch.float32):
+        if torch.is_tensor(value):
+            return value
+        return torch.tensor(float(value), device=device, dtype=dtype)
+
+    def _detector_train_chunk(self, im_data, im_info, gt_boxes, num_boxes):
+        device = im_data.device
+        if int(num_boxes.sum().item()) <= 0:
+            return None
+        base_feat = self._extract_base_features(im_data)
+
+        rois, rpn_loss_cls, rpn_loss_bbox = self.fasterRCNN.RCNN_rpn(
+            base_feat,
+            im_info,
+            gt_boxes,
+            num_boxes,
+        )
+        try:
+            roi_data = self.fasterRCNN.RCNN_proposal_target(rois, gt_boxes, num_boxes)
+        except ValueError as exc:
+            if 'bg_num_rois = 0 and fg_num_rois = 0' in str(exc):
+                return None
+            raise
+        rois, rois_label, rois_target, rois_inside_ws, rois_outside_ws = roi_data
+
+        rois_label = rois_label.view(-1).long()
+        rois_target = rois_target.view(-1, rois_target.size(2))
+        rois_inside_ws = rois_inside_ws.view(-1, rois_inside_ws.size(2))
+        rois_outside_ws = rois_outside_ws.view(-1, rois_outside_ws.size(2))
+
+        rois_flat = rois.view(-1, 5)
+        pooled_feat = self.fasterRCNN.RCNN_roi_align(base_feat, rois_flat)
+        pooled_feat = self.fasterRCNN._head_to_tail(pooled_feat)
+
+        bbox_pred = self.fasterRCNN.RCNN_bbox_pred(pooled_feat)
+        if not self.fasterRCNN.class_agnostic:
+            bbox_pred_view = bbox_pred.view(
+                bbox_pred.size(0),
+                int(bbox_pred.size(1) / 4),
+                4,
+            )
+            bbox_pred = torch.gather(
+                bbox_pred_view,
+                1,
+                rois_label.view(rois_label.size(0), 1, 1).expand(rois_label.size(0), 1, 4),
+            ).squeeze(1)
+
+        cls_score = self.fasterRCNN.RCNN_cls_score(pooled_feat)
+        cls_loss_weights = None
+        if self.detector_cls_loss == 'weighted_ce' and self.rcnn_cls_weights is not None:
+            cls_loss_weights = self.rcnn_cls_weights.to(device=cls_score.device, dtype=cls_score.dtype)
+        rcnn_loss_cls = F.cross_entropy(cls_score, rois_label, weight=cls_loss_weights)
+
+        if self.detector_bbox_loss in ('smoothl1', 'smooth_l1'):
+            rcnn_loss_bbox = _smooth_l1_loss(
+                bbox_pred,
+                rois_target,
+                rois_inside_ws,
+                rois_outside_ws,
+            )
+        else:
+            positive = rois_label > 0
+            if torch.any(positive):
+                delta_std = torch.tensor([0.1, 0.1, 0.2, 0.2], dtype=bbox_pred.dtype, device=device)
+                delta_mean = torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=bbox_pred.dtype, device=device)
+                pred_deltas = bbox_pred * delta_std + delta_mean
+                target_deltas = rois_target * delta_std + delta_mean
+                proposal_boxes = rois_flat[:, 1:5]
+                pred_boxes = bbox_transform_inv(
+                    proposal_boxes.unsqueeze(0),
+                    pred_deltas.unsqueeze(0),
+                    1,
+                ).squeeze(0)
+                target_boxes = bbox_transform_inv(
+                    proposal_boxes.unsqueeze(0),
+                    target_deltas.unsqueeze(0),
+                    1,
+                ).squeeze(0)
+                rcnn_loss_bbox = _aligned_giou_loss(pred_boxes[positive], target_boxes[positive])
+            else:
+                rcnn_loss_bbox = bbox_pred.sum() * 0.0
+
+        rpn_loss_cls = self._ensure_scalar_tensor(rpn_loss_cls, device=device, dtype=rcnn_loss_cls.dtype)
+        rpn_loss_bbox = self._ensure_scalar_tensor(rpn_loss_bbox, device=device, dtype=rcnn_loss_bbox.dtype)
+
+        topk = min(5, cls_score.shape[1])
+        top1_hits = int((cls_score.argmax(dim=1) == rois_label).sum().item())
+        top5_hits = int(
+            cls_score.topk(topk, dim=1).indices.eq(rois_label.unsqueeze(1)).any(dim=1).sum().item()
+        )
+
+        return {
+            'rpn_loss_cls': rpn_loss_cls,
+            'rpn_loss_bbox': rpn_loss_bbox,
+            'rcnn_loss_cls': rcnn_loss_cls,
+            'rcnn_loss_bbox': rcnn_loss_bbox,
+            'roi_top1_hits': top1_hits,
+            'roi_top5_hits': top5_hits,
+            'roi_count': int(rois_label.numel()),
+            'frame_count': int(im_data.shape[0]),
+        }
+
+    def forward_detector_pretrain(self, im_data, im_info, gt_boxes, num_boxes):
+        device = im_data.device
+        counter = 0
+        loss_names = ('rpn_loss_cls', 'rpn_loss_bbox', 'rcnn_loss_cls', 'rcnn_loss_bbox')
+        aggregated_losses = {
+            name: torch.tensor(0.0, device=device, dtype=im_data.dtype if im_data.dtype.is_floating_point else torch.float32)
+            for name in loss_names
+        }
+        total_frames = 0
+        total_roi_count = 0
+        total_top1_hits = 0
+        total_top5_hits = 0
+        skipped_chunks = 0
+
+        while counter < im_data.shape[0]:
+            end = min(counter + self.detector_chunk, im_data.shape[0])
+            chunk_stats = self._detector_train_chunk(
+                im_data[counter:end],
+                im_info[counter:end],
+                gt_boxes[counter:end],
+                num_boxes[counter:end],
+            )
+            if chunk_stats is None:
+                skipped_chunks += 1
+                counter = end
+                continue
+            chunk_frames = max(1, int(chunk_stats['frame_count']))
+            total_frames += chunk_frames
+            total_roi_count += int(chunk_stats['roi_count'])
+            total_top1_hits += int(chunk_stats['roi_top1_hits'])
+            total_top5_hits += int(chunk_stats['roi_top5_hits'])
+            for name in loss_names:
+                aggregated_losses[name] = aggregated_losses[name] + chunk_stats[name] * chunk_frames
+            counter = end
+
+        if total_frames == 0:
+            return None
+        normalizer = float(max(1, total_frames))
+        for name in loss_names:
+            aggregated_losses[name] = aggregated_losses[name] / normalizer
+        aggregated_losses['loss'] = sum(aggregated_losses[name] for name in loss_names)
+        aggregated_losses['roi_top1'] = float(total_top1_hits) / float(max(1, total_roi_count))
+        aggregated_losses['roi_top5'] = float(total_top5_hits) / float(max(1, total_roi_count))
+        aggregated_losses['roi_count'] = total_roi_count
+        aggregated_losses['frame_count'] = total_frames
+        aggregated_losses['skipped_chunks'] = skipped_chunks
+        return aggregated_losses
 
     def forward(self, im_data, im_info, gt_boxes, num_boxes, gt_annotation, im_all):
         device = im_data.device
@@ -287,25 +605,75 @@ class detector(nn.Module):
                 a_rel = []
                 s_rel = []
                 c_rel = []
-                for i, j in enumerate(DETECTOR_FOUND_IDX):
+                for i, found_idx in enumerate(DETECTOR_FOUND_IDX):
+                    frame_mask = FINAL_BBOXES_X[:, 0] == i
+                    frame_global_idx = global_idx[frame_mask]
+                    if frame_global_idx.numel() == 0:
+                        continue
 
-                    for k, kk in enumerate(GT_RELATIONS[i]):
-                        if 'person_bbox' in kk.keys():
-                            kkk = k
+                    person_relation_idx = None
+                    for rel_idx, rel in enumerate(GT_RELATIONS[i]):
+                        if 'person_bbox' in rel.keys():
+                            person_relation_idx = rel_idx
                             break
-                    localhuman = int(global_idx[FINAL_BBOXES_X[:, 0] == i][kkk].item())
 
-                    for m, n in enumerate(j):
-                        if 'class' in GT_RELATIONS[i][m].keys():
-                            im_idx.append(i)
+                    local_human_idx = None
+                    if person_relation_idx is not None and person_relation_idx < len(found_idx):
+                        local_human_idx = int(found_idx[person_relation_idx])
+                    if local_human_idx is None:
+                        frame_labels = FINAL_LABELS_X[frame_mask]
+                        human_candidates = torch.nonzero(frame_labels == 1, as_tuple=False).view(-1)
+                        if human_candidates.numel() > 0:
+                            local_human_idx = int(human_candidates[0].item())
+                        else:
+                            local_human_idx = 0
 
-                            pair.append([localhuman, int(global_idx[FINAL_BBOXES_X[:, 0] == i][int(n)].item())])
+                    local_human_idx = max(0, min(local_human_idx, int(frame_global_idx.numel()) - 1))
+                    localhuman = int(frame_global_idx[local_human_idx].item())
 
-                            a_rel.append(GT_RELATIONS[i][m]['attention_relationship'].tolist())
-                            s_rel.append(GT_RELATIONS[i][m]['spatial_relationship'].tolist())
-                            c_rel.append(GT_RELATIONS[i][m]['contacting_relationship'].tolist())
+                    for rel_idx, rel in enumerate(GT_RELATIONS[i]):
+                        if 'class' not in rel.keys():
+                            continue
+                        if rel_idx >= len(found_idx):
+                            continue
+                        local_obj_idx = int(found_idx[rel_idx])
+                        if local_obj_idx < 0 or local_obj_idx >= frame_global_idx.numel():
+                            continue
+                        obj_global_idx = int(frame_global_idx[local_obj_idx].item())
+                        if obj_global_idx == localhuman:
+                            continue
 
-                pair = torch.tensor(pair, device=device)
+                        im_idx.append(i)
+                        pair.append([localhuman, obj_global_idx])
+                        a_rel.append(rel['attention_relationship'].tolist())
+                        s_rel.append(rel['spatial_relationship'].tolist())
+                        c_rel.append(rel['contacting_relationship'].tolist())
+
+                if len(pair) == 0:
+                    union_channels = (
+                        int(FINAL_BASE_FEATURES.shape[1])
+                        if FINAL_BASE_FEATURES.ndim == 4 and FINAL_BASE_FEATURES.shape[1] > 0
+                        else 1024
+                    )
+                    entry = {'boxes': FINAL_BBOXES_X,
+                             'labels': FINAL_LABELS_X,
+                             'scores': FINAL_SCORES_X,
+                             'distribution': FINAL_DISTRIBUTIONS,
+                             'im_idx': torch.empty((0,), dtype=torch.float, device=device),
+                             'pair_idx': torch.empty((0, 2), dtype=torch.long, device=device),
+                             'features': FINAL_FEATURES_X,
+                             'union_feat': torch.empty(
+                                 (0, union_channels, 7, 7),
+                                 dtype=FINAL_BASE_FEATURES.dtype,
+                                 device=device,
+                             ),
+                             'spatial_masks': torch.empty((0, 2, 27, 27), dtype=torch.float, device=device),
+                             'attention_gt': a_rel,
+                             'spatial_gt': s_rel,
+                             'contacting_gt': c_rel}
+                    return entry
+
+                pair = torch.tensor(pair, dtype=torch.long, device=device)
                 im_idx = torch.tensor(im_idx, dtype=torch.float, device=device)
                 union_boxes = torch.cat((im_idx[:, None],
                                          torch.min(FINAL_BBOXES_X[:, 1:3][pair[:, 0]],
@@ -396,7 +764,9 @@ class detector(nn.Module):
                     inputs_data = im_data[counter:counter + self.detector_chunk]
                 else:
                     inputs_data = im_data[counter:]
-                base_feat = self.fasterRCNN.RCNN_base(inputs_data)
+                # Keep PredCLS/SGCLS on the same backbone path as SGDET so ViT
+                # checkpoints do not silently fall back to the legacy ResNet base.
+                base_feat = self._extract_base_features(inputs_data)
                 FINAL_BASE_FEATURES = torch.cat((FINAL_BASE_FEATURES, base_feat), 0)
                 counter += self.detector_chunk
 
@@ -486,4 +856,3 @@ class detector(nn.Module):
                              'im_info': im_info[0, 2]}
 
                     return entry
-

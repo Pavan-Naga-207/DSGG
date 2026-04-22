@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}"
+mkdir -p logs outputs
+
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/outputs/detector_stage1_phase3_dinov2_pilot_$(date +%Y%m%d_%H%M%S)}"
+PARTITION="${PARTITION:-condo}"
+NODELIST="${NODELIST:-condo7}"
+JOB_NAME="${JOB_NAME:-p3det_dino_pilot}"
+DATA_PATH="${DATA_PATH:-$HOME/special_topics/datasets/action_genome}"
+
+SBATCH_EXPORT="ALL,PARTITION=${PARTITION},DATA_PATH=${DATA_PATH},SAVE_PATH=${OUTPUT_DIR},BACKBONE=dinov2,PHASE3_DINOV2_MODEL=${PHASE3_DINOV2_MODEL:-vit_base_patch14_dinov2},PHASE3_FREEZE_BACKBONE=${PHASE3_FREEZE_BACKBONE:-1},PHASE3_INPUT_SIZE=${PHASE3_INPUT_SIZE:-1024},PHASE3_LSJ_MIN=${PHASE3_LSJ_MIN:-0.5},PHASE3_LSJ_MAX=${PHASE3_LSJ_MAX:-2.0},PHASE3_ASSERT_DINOV2_PATH=1,DETECTOR_REINIT_ROI_HEADS=1,DETECTOR_SKIP_AG_HEAD_LOAD=1,DETECTOR_BN_MODE=groupnorm,VITDET_DET_CHUNK=${VITDET_DET_CHUNK:-1},BATCH_SIZE=${BATCH_SIZE:-1},NUM_WORKERS=${NUM_WORKERS:-4},EVAL_NUM_WORKERS=${EVAL_NUM_WORKERS:-2},VIT_LR=${VIT_LR:-0.0},HEAD_LR=${HEAD_LR:-1e-4},WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4},NEPOCH=${NEPOCH:-1},MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-50},MAP_MAX_STEPS=${MAP_MAX_STEPS:-10},MAP_MAX_VIDEO_FRAMES=${MAP_MAX_VIDEO_FRAMES:-12},LOG_EVERY=${LOG_EVERY:-10},JOB_NAME=${JOB_NAME}"
+
+JOB_ID=$(sbatch \
+  --job-name "${JOB_NAME}" \
+  --partition "${PARTITION}" \
+  --nodelist "${NODELIST}" \
+  --export "${SBATCH_EXPORT}" \
+  scripts/train_detector_stage1_phase3_dinov2_h100.sbatch | awk '{print $4}')
+
+echo "Submitted Phase3 DINOv2 pilot job: ${JOB_ID}"
+echo "  node: ${NODELIST}"
+echo "  output: ${OUTPUT_DIR}"
+echo "  log: ${PROJECT_ROOT}/logs/sttran_p3_det_${JOB_ID}.log"

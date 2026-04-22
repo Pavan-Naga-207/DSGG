@@ -40,6 +40,16 @@ ENC_LAYER="${ENC_LAYER:-1}"
 DEC_LAYER="${DEC_LAYER:-3}"
 BACKBONE="${BACKBONE:-resnet101}"
 DET_THRESHOLD="${DET_THRESHOLD:-0.1}"
+if [[ -z "${DETECTOR_BN_MODE:-}" ]]; then
+  if [[ "${BACKBONE}" == "vitdet" ]]; then
+    DETECTOR_BN_MODE=groupnorm
+  else
+    DETECTOR_BN_MODE=batchnorm
+  fi
+fi
+DETECTOR_GN_GROUPS="${DETECTOR_GN_GROUPS:-32}"
+export DETECTOR_BN_MODE
+export DETECTOR_GN_GROUPS
 
 if [[ -z "${MODEL_PATH}" ]]; then
   echo "MODEL_PATH is required, e.g.:"
@@ -107,6 +117,12 @@ export EVAL_NUM_WORKERS="${EVAL_NUM_WORKERS:-4}"
 export EVAL_CONSTRAINTS="${EVAL_CONSTRAINTS:-with,semi,no}"
 export MAX_TEST_STEPS="${MAX_TEST_STEPS:--1}"
 
+if [[ "${MODE}" == "sgcls" ]]; then
+  export SGCLS_DUPLICATE_POLICY="${SGCLS_DUPLICATE_POLICY:-iou}"
+  export SGCLS_LABEL_SOURCE="${SGCLS_LABEL_SOURCE:-detector}"
+  export SGCLS_DUPLICATE_IOU_THRESHOLD="${SGCLS_DUPLICATE_IOU_THRESHOLD:-0.7}"
+fi
+
 echo "Running on host: $(hostname)"
 echo "CUDA device(s): ${CUDA_VISIBLE_DEVICES:-unset}"
 echo "Mode: ${MODE}"
@@ -117,6 +133,12 @@ echo "Eval constraints: ${EVAL_CONSTRAINTS}"
 echo "Eval workers: ${EVAL_NUM_WORKERS}"
 echo "Backbone: ${BACKBONE}"
 echo "Det threshold: ${DET_THRESHOLD}"
+echo "Detector norm mode: ${DETECTOR_BN_MODE} (groups=${DETECTOR_GN_GROUPS})"
+if [[ "${MODE}" == "sgcls" ]]; then
+  echo "SGCLS duplicate policy: ${SGCLS_DUPLICATE_POLICY}"
+  echo "SGCLS label source: ${SGCLS_LABEL_SOURCE}"
+  echo "SGCLS duplicate IoU threshold: ${SGCLS_DUPLICATE_IOU_THRESHOLD}"
+fi
 echo "Python module: ${PYTHON_MODULE}"
 
 python -u evaluate_only.py \

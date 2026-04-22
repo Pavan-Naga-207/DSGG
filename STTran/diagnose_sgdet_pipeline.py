@@ -51,6 +51,23 @@ def _load_checkpoint_state_dicts(path: str, device: torch.device) -> Tuple[Dict[
     return _strip_ddp_prefix(model_state_dict), _strip_ddp_prefix(detector_state_dict)
 
 
+def _load_state_dict_flexible(module: torch.nn.Module, incoming_state_dict):
+    if incoming_state_dict is None:
+        return [], [], []
+    current_state = module.state_dict()
+    compatible_state = {}
+    skipped_shape_keys = []
+    for key, value in incoming_state_dict.items():
+        if key not in current_state:
+            continue
+        if current_state[key].shape != value.shape:
+            skipped_shape_keys.append((key, tuple(value.shape), tuple(current_state[key].shape)))
+            continue
+        compatible_state[key] = value
+    missing_keys, unexpected_keys = module.load_state_dict(compatible_state, strict=False)
+    return missing_keys, unexpected_keys, skipped_shape_keys
+
+
 def _safe_mean(values: List[float]) -> float:
     return float(np.mean(values)) if values else 0.0
 
@@ -172,6 +189,7 @@ def main() -> None:
         data_path=args.data_path,
         filter_nonperson_box_frame=True,
         filter_small_box=True,
+        backbone=args.backbone,
     )
     dataloader = _build_loader(ag_test, args.num_workers, args.pin_memory)
 
@@ -198,15 +216,28 @@ def main() -> None:
 
     model_state_dict, detector_state_dict = _load_checkpoint_state_dicts(args.model_path, device)
     if detector_state_dict is not None:
-        det_missing_keys, det_unexpected_keys = object_detector_model.load_state_dict(detector_state_dict, strict=False)
+        det_missing_keys, det_unexpected_keys, det_skipped_shapes = _load_state_dict_flexible(
+            object_detector_model, detector_state_dict
+        )
         if det_missing_keys:
             print("detector_missing_keys:", len(det_missing_keys))
         if det_unexpected_keys:
             print("detector_unexpected_keys:", len(det_unexpected_keys))
+        if det_skipped_shapes:
+            print("detector_skipped_shape_keys:", len(det_skipped_shapes))
+            print(
+                "detector_first_skipped_shape_key:",
+                det_skipped_shapes[0][0],
+                det_skipped_shapes[0][1],
+                "->",
+                det_skipped_shapes[0][2],
+            )
 
-    missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
+    missing_keys, unexpected_keys, model_skipped_shapes = _load_state_dict_flexible(model, model_state_dict)
     print("checkpoint_missing_keys:", len(missing_keys))
     print("checkpoint_unexpected_keys:", len(unexpected_keys))
+    if model_skipped_shapes:
+        print("checkpoint_model_skipped_shape_keys:", len(model_skipped_shapes))
 
     videos_seen = 0
     frames_seen = 0

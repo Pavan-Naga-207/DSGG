@@ -30,6 +30,6 @@ class ViTDetBackbone(nn.Module):
 
     def forward(self, images: Tensor) -> Dict[str, Tensor]:
         aligned, raw = self.bridge(images)
-        base = aligned["p3"]  # stride 1/16, aligns with ResNet C4
+        base = aligned["p3"] 
         return {"base": base, **aligned, **{f"raw_{k}": v for k, v in raw.items()}}
 
